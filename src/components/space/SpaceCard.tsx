@@ -1,0 +1,224 @@
+import { Link } from "react-router-dom";
+import { Bookmark, Scale } from "lucide-react";
+import type { SpaceListing } from "@/types/space";
+
+import { money, moneyCompact, lastUpdatedShort, isStale } from "@/lib/format";
+import { CATEGORY_STYLE } from "@/data/catalog";
+import { cn } from "@/lib/cn";
+import { useI18n } from "@/i18n";
+import { spaceName, displayImage } from "@/lib/localize";
+import { MatchPill } from "./MatchRing";
+import { TrustBadge, AvailabilityBadge } from "./badges";
+import { SpacePhoto } from "./SpacePhoto";
+
+/**
+ * The key specification line changes per category. A garage has no bedrooms
+ * and a pond has no bathrooms, so nothing renders a blank or a dash.
+ */
+export function keySpec(listing: SpaceListing): string {
+  const { attributes: a, category, availability } = listing.space;
+
+  switch (category) {
+    case "living": {
+      const parts: string[] = [];
+      if (a.bedrooms) parts.push(`${a.bedrooms} bed`);
+      if (a.bathrooms) parts.push(`${a.bathrooms} bath`);
+      if (a.sizeSqft) parts.push(`${a.sizeSqft} sqft`);
+      return parts.join(" · ");
+    }
+    case "business": {
+      const parts: string[] = [];
+      if (a.sizeSqft) parts.push(`${a.sizeSqft} sqft`);
+      if (a.frontageFt) parts.push(`${a.frontageFt} ft frontage`);
+      if (a.workstations) parts.push(`${a.workstations} desks`);
+      return parts.join(" · ");
+    }
+    case "storage": {
+      const parts: string[] = [];
+      if (a.sizeSqft) parts.push(`${a.sizeSqft} sqft`);
+      if (a.ceilingHeightFt) parts.push(`${a.ceilingHeightFt} ft ceiling`);
+      if (a.loadingAccess) parts.push("loading access");
+      return parts.join(" · ");
+    }
+    case "parking": {
+      if (availability.note) return availability.note;
+      const parts: string[] = [];
+      if (a.carSlots) parts.push(`${a.carSlots} car`);
+      if (a.motorcycleSlots) parts.push(`${a.motorcycleSlots} motorcycle`);
+      parts.push(a.covered ? "covered" : "open");
+      return parts.join(" · ");
+    }
+    case "land": {
+      const parts: string[] = [];
+      if (a.landAreaDecimal) parts.push(`${a.landAreaDecimal} decimal`);
+      if (a.landUse) parts.push(a.landUse.toLowerCase());
+      if (a.roadAccess) parts.push("road access");
+      return parts.join(" · ");
+    }
+  }
+}
+
+export function SpaceCard({
+  listing,
+  matchScore,
+  saved = false,
+  comparing = false,
+  onToggleSave,
+  onToggleCompare,
+  size = "default",
+}: {
+  listing: SpaceListing;
+  matchScore?: number;
+  saved?: boolean;
+  comparing?: boolean;
+  onToggleSave?: (id: string) => void;
+  onToggleCompare?: (id: string) => void;
+  size?: "default" | "large" | "compact";
+}) {
+  const { t, language } = useI18n();
+  const { space, property } = listing;
+  const cat = CATEGORY_STYLE[space.category];
+  const cover = space.images[0];
+  const occupied = space.availability.status === "occupied";
+  const isSale = space.transaction === "sale";
+
+  return (
+    <article
+      className={cn(
+        "group lift relative flex flex-col overflow-hidden rounded-card bg-surface",
+        "ring-1 ring-hairline",
+        "focus-within:ring-2 focus-within:ring-aqua-600",
+        occupied && "opacity-75",
+      )}
+    >
+      <div
+        className={cn(
+          "relative",
+          size === "large" ? "aspect-16/10" : size === "compact" ? "aspect-3/2" : "aspect-4/3",
+        )}
+      >
+        <SpacePhoto
+          src={displayImage(cover)}
+          alt={cover.alt}
+          category={space.category}
+          demo={cover.demo}
+          bandPosition="bottom"
+          className="size-full"
+          imgClassName="zoom"
+        />
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-2/3 img-scrim" aria-hidden />
+
+        <div className="absolute inset-x-3 top-3 flex items-start justify-between gap-2">
+          {matchScore !== undefined ? (
+            <MatchPill score={matchScore} />
+          ) : (
+            <span className={cn("rounded-full px-2.5 py-1 text-xs font-semibold", cat.chip)}>
+              {t(`category.${space.category}` as never)}
+            </span>
+          )}
+
+          <div className="flex gap-1.5">
+            {onToggleCompare && (
+              <button
+                type="button"
+                aria-label={comparing ? `Remove ${spaceName(space, language)} from compare` : `Add ${spaceName(space, language)} to compare`}
+                aria-pressed={comparing}
+                onClick={() => onToggleCompare(space.id)}
+                className={cn(
+                  "press rounded-full p-2 backdrop-blur-sm transition-colors",
+                  comparing ? "bg-aqua-600 text-white" : "bg-surface/90 text-ink-soft hover:bg-surface",
+                )}
+              >
+                <Scale size={15} aria-hidden />
+              </button>
+            )}
+            {onToggleSave && (
+              <button
+                type="button"
+                aria-label={saved ? `Remove ${spaceName(space, language)} from saved` : `Save ${spaceName(space, language)}`}
+                aria-pressed={saved}
+                onClick={() => onToggleSave(space.id)}
+                className="rounded-full bg-surface/90 p-2 text-ink-soft backdrop-blur-sm transition-colors hover:bg-surface hover:text-aqua-700"
+              >
+                <Bookmark size={15} className={cn(saved && "fill-aqua-600 text-aqua-600")} aria-hidden />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="absolute inset-x-3.5 bottom-3">
+          <p className="font-display text-xl font-bold leading-none text-white tnum">
+            {isSale ? money(space.cost.price) : moneyCompact(space.cost.price)}
+            <span className="ml-1 text-sm font-medium text-white/75">
+              {isSale ? "" : t("transaction.perMonth")}
+            </span>
+          </p>
+          <h3 className="mt-1 truncate font-semibold text-white">
+            <Link to={`/space/${space.id}`} className="after:absolute after:inset-0 focus:outline-none">
+              {spaceName(space, language)}
+            </Link>
+          </h3>
+          <p className="truncate text-sm text-white/75">
+            {property.neighborhood}, {property.area}
+          </p>
+        </div>
+
+        <span className="pointer-events-none absolute bottom-3 right-3.5 rounded bg-ink/55 px-1.5 py-0.5 text-[0.6rem] font-semibold uppercase tracking-wide text-white/90">
+          {t("misc.demo")}
+        </span>
+      </div>
+
+      <div className="flex flex-1 flex-col gap-2 p-3.5">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className={cn("rounded px-1.5 py-0.5 text-xs font-semibold", cat.chip)}>
+            {t(`type.${space.spaceType}` as never)}
+          </span>
+          {isSale && (
+            <span className="rounded bg-ink px-1.5 py-0.5 text-xs font-semibold text-ivory">
+              {t("transaction.forSale")}
+            </span>
+          )}
+          {/* Paid placement says so. An advertisement that looks like a result
+              is exactly what makes a listing site untrustworthy, and being
+              trustworthy is the whole argument here. */}
+          {space.sponsoredUntil && (
+            <span
+              title={t("sponsored.explain")}
+              className="rounded bg-sun/60 px-1.5 py-0.5 text-xs font-semibold text-sun-ink"
+            >
+              {t("sponsored.label")}
+            </span>
+          )}
+          {/* Availability only when it is not the expected "free" — a badge
+              that appears on nine cards in ten carries no information. */}
+          {space.availability.status !== "available" && (
+            <AvailabilityBadge availability={space.availability} />
+          )}
+        </div>
+
+        <p className="text-sm text-ink-soft">{keySpec(listing)}</p>
+
+        {space.transaction === "rent" &&
+          (space.cost.estimatedMonthly ? (
+            <p className="text-[0.8125rem] text-muted tnum">
+              {t("misc.aboutAllIn", { price: money(space.cost.estimatedMonthly) })}
+            </p>
+          ) : (
+            <p className="text-[0.8125rem] font-medium text-warn-700">{t("misc.fullCostNotListed")}</p>
+          ))}
+
+        <div className="mt-auto hidden items-center gap-2 border-t border-hairline pt-2.5 sm:flex">
+          <TrustBadge verification={space.verification} compact />
+          <span
+            className={cn(
+              "ml-auto text-xs",
+              isStale(space.lastUpdated) ? "font-medium text-warn-700" : "text-muted",
+            )}
+          >
+            {lastUpdatedShort(space.lastUpdated)}
+          </span>
+        </div>
+      </div>
+    </article>
+  );
+}

@@ -1,0 +1,974 @@
+import { useEffect, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { ArrowLeft, ArrowRight, Check, Plus, Archive, Trash2, Undo2 } from "lucide-react";
+import { useHabito } from "@/hooks/useHabito";
+import { db } from "@/lib/api";
+import { PageHeader } from "@/components/layout/PageHeader";
+import { Modal } from "@/components/ui/Modal";
+import { useToast } from "@/components/ui/Toast";
+import { Button } from "@/components/ui/Button";
+import { CATEGORY_STYLE, TYPES_BY_CATEGORY, AMENITIES, AMENITIES_BY_CATEGORY } from "@/data/catalog";
+import { AREAS } from "@/data/areas";
+import { AreaPicker } from "@/components/ui/AreaPicker";
+import { PinPicker } from "@/components/space/PinPicker";
+import { SPACE_TYPE_LABEL, CATEGORY_OF_TYPE } from "@/types/space";
+import type {
+  AmenityKey, AvailabilityStatus, GenderPreference, ListingStatus, OccupancyRules, Property,
+  Space, SpaceAttributes, SpaceCategory, SpaceImage, SpaceType, TransactionType,
+} from "@/types/space";
+import { PhotoUploader } from "@/components/space/PhotoUploader";
+import { money } from "@/lib/format";
+import { cn } from "@/lib/cn";
+import { useI18n } from "@/i18n";
+
+const CATEGORIES = Object.keys(CATEGORY_STYLE) as SpaceCategory[];
+const STEPS = ["What", "Where", "Details", "Included", "Photos", "Price", "Review"];
+
+/**
+ * Guided listing flow. The Details step asks different questions per category —
+ * a garage is never asked how many bedrooms it has.
+ */
+/**
+ * One form, two jobs. Editing is the same six steps with the answers already
+ * filled in, so an owner correcting a price doesn't meet a different screen.
+ */
+export default function ListSpace() {
+  const navigate = useNavigate();
+  const { id: editingId } = useParams();
+  const { t } = useI18n();
+  const { notify } = useToast();
+  const { refresh, ownerId } = useHabito();
+
+  const editing = Boolean(editingId);
+  const [existing, setExisting] = useState<Space | null>(null);
+  const [loaded, setLoaded] = useState(!editingId);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [working, setWorking] = useState(false);
+
+  const [step, setStep] = useState(0);
+  const [properties, setProperties] = useState<Property[]>([]);
+  const [saving, setSaving] = useState(false);
+
+  const [spaceType, setSpaceType] = useState<SpaceType>("apartment");
+  const [transaction, setTransaction] = useState<TransactionType>("rent");
+  const [propertyId, setPropertyId] = useState<string>("");
+  const [newPropertyName, setNewPropertyName] = useState("");
+  const [area, setArea] = useState("Mirpur");
+  const [neighborhood, setNeighborhood] = useState("");
+  const [name, setName] = useState("");
+  const [attrs, setAttrs] = useState<SpaceAttributes>({});
+  const [amenities, setAmenities] = useState<AmenityKey[]>([]);
+  const [rules, setRules] = useState<OccupancyRules>({
+    familyAllowed: true,
+    bachelorAllowed: true,
+    studentFriendly: true,
+    genderPreference: "any",
+    maxOccupants: null,
+  });
+  const [photos, setPhotos] = useState<SpaceImage[]>([]);
+  // Null until the owner drags the marker; the area centre is used meanwhile.
+  const [pin, setPin] = useState<[number, number] | null>(null);
+  const [fee, setFee] = useState<number | null>(null);
+  const [allowance, setAllowance] = useState<{ used: number; hasPlan: boolean } | null>(null);
+  const [paying, setPaying] = useState(false);
+  // Whether the owner touched the photos at all. Without this, removing every
+  // photo is indistinguishable from not opening the step, and the old images
+  // come straight back on save.
+  const [photosTouched, setPhotosTouched] = useState(false);
+  // Photos are filed under this id before the space row exists.
+  const [draftId] = useState(() => crypto.randomUUID());
+  const [price, setPrice] = useState(12000);
+  const [serviceCharge, setServiceCharge] = useState<number | "">("");
+  const [utilities, setUtilities] = useState<number | "">("");
+  const [status, setStatus] = useState<AvailabilityStatus>("available");
+  const [availableFrom, setAvailableFrom] = useState(new Date().toISOString().slice(0, 10));
+
+  const category = CATEGORY_OF_TYPE[spaceType];
+  /** The chosen area's centre, used as the pin's starting point. */
+  const selectedArea = AREAS.find((a) => a.name === area);
+
+  // What it costs to publish this, and how much of the free allowance is left.
+  useEffect(() => {
+    void db.listingFee(category).then(setFee);
+  }, [category]);
+
+  useEffect(() => {
+    if (propertyId === "new") {
+      setAllowance({ used: 0, hasPlan: false });
+      return;
+    }
+    void db.listingAllowance(propertyId).then(setAllowance);
+  }, [propertyId]);
+
+  // Fetched by id rather than taken from the browsing list, because an
+  // archived space is deliberately absent from that list.
+  useEffect(() => {
+    if (!editingId) return;
+
+    void db.space(editingId).then((space) => {
+      if (space) {
+        setExisting(space);
+        setSpaceType(space.spaceType);
+        setTransaction(space.transaction);
+        setPropertyId(space.propertyId);
+        setName(space.name);
+        setAttrs(space.attributes);
+        setAmenities(space.amenities);
+        if (space.rules) setRules(space.rules);
+        // Seed illustrations aren't the owner's photos, so don't present them
+        // as something they uploaded.
+        setPhotos(space.synthetic ? [] : space.images);
+        setPrice(space.cost.price);
+        setServiceCharge(space.cost.serviceCharge ?? "");
+        setUtilities(space.cost.utilities ?? "");
+        setStatus(space.availability.status);
+        setAvailableFrom(space.availability.availableFrom);
+      }
+      setLoaded(true);
+    });
+  }, [editingId]);
+
+  useEffect(() => {
+    void db.properties(ownerId).then((p) => {
+      setProperties(p);
+      if (p.length && !propertyId) setPropertyId(p[0].id);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ownerId]);
+
+  useEffect(() => {
+    // Only when starting fresh — on an edit this would erase what's there.
+    if (editing) return;
+    setAttrs({});
+    setAmenities([]);
+  }, [category, editing]);
+
+  const setAttr = <K extends keyof SpaceAttributes>(k: K, v: SpaceAttributes[K]) =>
+    setAttrs((a) => ({ ...a, [k]: v }));
+
+  const setListingStatus = async (next: ListingStatus) => {
+    if (!existing) return;
+    setWorking(true);
+    await db.updateSpace(existing.id, { status: next });
+    await refresh();
+    setWorking(false);
+    notify(next === "archived" ? t("edit.archived") : t("edit.restored"));
+    navigate("/portfolio");
+  };
+
+  const destroy = async () => {
+    if (!existing) return;
+    setWorking(true);
+    await db.deleteSpace(existing.id);
+    await refresh();
+    setWorking(false);
+    notify(t("edit.deleted"));
+    navigate("/portfolio");
+  };
+
+  const saveEdit = async () => {
+    if (!existing) return;
+    setSaving(true);
+
+    const disclosed = serviceCharge !== "" && utilities !== "";
+    await db.updateSpace(existing.id, {
+      name: name.trim() || SPACE_TYPE_LABEL[spaceType],
+      transaction,
+      cost: {
+        price,
+        serviceCharge: serviceCharge === "" ? null : Number(serviceCharge),
+        utilities: utilities === "" ? null : Number(utilities),
+        securityDeposit: existing.cost.securityDeposit,
+        advanceMonths: existing.cost.advanceMonths,
+        estimatedMonthly: disclosed ? price + Number(serviceCharge) + Number(utilities) : null,
+      },
+      attributes: attrs,
+      amenities,
+      rules,
+      availability: { ...existing.availability, status, availableFrom },
+      // An owner who removed every photo meant to remove them. Fall back to the
+      // illustration rather than quietly restoring what they deleted.
+      images: photosTouched
+        ? photos.length
+          ? photos
+          : placeholderImages(category, name || SPACE_TYPE_LABEL[spaceType])
+        : existing.images,
+    });
+
+    await refresh();
+    setSaving(false);
+    notify(t("edit.saved"));
+    navigate(`/space/${existing.id}`);
+  };
+
+  /**
+   * Publishing is where the fee is taken.
+   *
+   * The space is created first and paid for second, so a failed payment leaves
+   * a draft the owner can return to rather than losing everything they typed.
+   */
+  const publish = async () => {
+    setSaving(true);
+    const areaMeta = AREAS.find((a) => a.name === area)!;
+
+    let targetId = propertyId;
+    if (propertyId === "__new") {
+      const created = await db.createProperty({
+        name: newPropertyName.trim() || `${area} property`,
+        ownerId,
+        area,
+        neighborhood: neighborhood.trim() || area,
+        address: `${neighborhood.trim() || area}, ${area}`,
+        district: areaMeta.district,
+        geography: areaMeta.geography,
+        latitude: pin ? pin[0] : areaMeta.latitude,
+        locationSource: pin ? ("pinned" as const) : ("area" as const),
+        longitude: pin ? pin[1] : areaMeta.longitude,
+        nearby: [],
+        coverImage: `/photos/${category === "land" ? "land-1" : "living-1"}.svg`,
+      });
+      targetId = created.id;
+    }
+
+    const disclosed = serviceCharge !== "" && utilities !== "";
+    const label = ["Exterior", "Interior", "Detail"];
+
+    const created = await db.createSpace({
+      propertyId: targetId,
+      name: name.trim() || SPACE_TYPE_LABEL[spaceType],
+      category,
+      spaceType,
+      transaction,
+      cost: {
+        price,
+        serviceCharge: serviceCharge === "" ? null : Number(serviceCharge),
+        utilities: utilities === "" ? null : Number(utilities),
+        securityDeposit: null,
+        advanceMonths: transaction === "rent" ? 2 : null,
+        estimatedMonthly: disclosed ? price + Number(serviceCharge) + Number(utilities) : null,
+      },
+      attributes: attrs,
+      amenities,
+      rules,
+      availability: { status, availableFrom },
+      // Real photographs where the owner gave them; illustration otherwise, so
+      // a listing never looks photographed when it isn't.
+      images: photos.length
+        ? photos
+        : [0, 1].map((i) => ({
+            url: `/photos/${category}-${(i % 2) + 1}.svg`,
+            label: label[i],
+            alt: `Illustrative placeholder image for ${name || SPACE_TYPE_LABEL[spaceType]}`,
+            demo: true as const,
+          })),
+      description:
+        `${SPACE_TYPE_LABEL[spaceType]} in ${neighborhood.trim() || area}. Added through the Habito listing flow.`,
+      verification: { demo: true, owner: "identity-submitted", space: "documents-submitted" },
+      status: "published",
+      lastUpdated: new Date().toISOString().slice(0, 10),
+    });
+
+    await refresh();
+    setSaving(false);
+    navigate(`/space/${created.id}`);
+  };
+
+  const canAdvance = () => {
+    if (step === 1) return propertyId !== "" && (propertyId !== "__new" || newPropertyName.trim().length > 1);
+    if (step === 5) return price > 0;
+    return true;
+  };
+
+  if (!loaded) {
+    return <div className="container-page py-20 text-sm text-muted">{t("misc.loading")}</div>;
+  }
+
+  if (editing && !existing) {
+    return (
+      <div className="container-page py-20 text-center">
+        <h1 className="font-display text-2xl font-bold text-ink">{t("space.notFound")}</h1>
+        <Link to="/portfolio" className="mt-5 inline-block">
+          <Button>{t("nav.portfolio")}</Button>
+        </Link>
+      </div>
+    );
+  }
+
+  const archived = existing?.status === "archived";
+
+  return (
+    <>
+      <PageHeader
+        title={editing ? t("edit.title") : t("list.title")}
+        lead={editing ? t("edit.lead") : t("list.lead")}
+        actions={
+          editing ? (
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={working}
+                onClick={() => void setListingStatus(archived ? "published" : "archived")}
+              >
+                {archived ? <Undo2 size={15} aria-hidden /> : <Archive size={15} aria-hidden />}
+                {archived ? t("edit.restore") : t("edit.archive")}
+              </Button>
+              <Button variant="secondary" size="sm" onClick={() => setConfirmDelete(true)}>
+                <Trash2 size={15} aria-hidden />
+                {t("edit.delete")}
+              </Button>
+            </div>
+          ) : undefined
+        }
+      />
+
+      {archived && (
+        <div className="container-page pt-6">
+          <p className="rounded-card bg-warn-100 p-4 text-sm leading-relaxed text-warn-700">
+            {t("edit.archivedNotice")}
+          </p>
+        </div>
+      )}
+
+      <div className="container-page max-w-3xl py-8 md:py-10">
+        {/* Progress */}
+        <ol className="mb-8 flex items-center gap-1.5" aria-label="Progress">
+          {STEPS.map((label, i) => (
+            <li key={label} className="flex flex-1 items-center gap-1.5">
+              <div className="flex-1">
+                <div
+                  className={cn(
+                    "h-1 rounded-full transition-colors",
+                    i < step ? "bg-ink" : i === step ? "bg-aqua-400" : "bg-hairline",
+                  )}
+                />
+                <span
+                  className={cn(
+                    "mt-1.5 hidden text-xs font-semibold sm:block",
+                    i === step ? "text-ink" : "text-muted",
+                  )}
+                >
+                  {label}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ol>
+
+        <div className="rounded-card bg-surface p-5 ring-1 ring-hairline sm:p-7">
+          {step === 0 && (
+            <Step title={t("list.whatOffering")}>
+              <ul className="flex flex-wrap gap-2">
+                {CATEGORIES.flatMap((c) => TYPES_BY_CATEGORY[c]).map((t) => (
+                  <li key={t}>
+                    <Chip active={spaceType === t} onClick={() => setSpaceType(t)}>
+                      {SPACE_TYPE_LABEL[t]}
+                    </Chip>
+                  </li>
+                ))}
+              </ul>
+
+              <p className="mb-2 mt-6 text-sm font-medium text-ink-soft">Renting it out, or selling?</p>
+              <div className="inline-flex rounded-full bg-ivory-deep p-0.5">
+                {(["rent", "sale"] as TransactionType[]).map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    aria-pressed={transaction === t}
+                    onClick={() => setTransaction(t)}
+                    className={cn(
+                      "rounded-full px-5 py-2 text-sm font-bold transition-colors",
+                      transaction === t ? "bg-ink text-ivory" : "text-muted hover:text-ink",
+                    )}
+                  >
+                    {t === "rent" ? "Renting" : "Selling"}
+                  </button>
+                ))}
+              </div>
+            </Step>
+          )}
+
+          {step === 1 && (
+            <Step title={t("list.whereIsIt")}>
+              <p className="mb-2 text-sm font-medium text-ink-soft">Which property is this space in?</p>
+              <div className="space-y-2">
+                {properties.map((p) => (
+                  <label
+                    key={p.id}
+                    className={cn(
+                      "flex cursor-pointer items-center gap-3 rounded-2xl p-3 ring-1 transition-colors",
+                      propertyId === p.id ? "bg-aqua-50 ring-aqua-600" : "bg-ivory ring-hairline hover:ring-hairline-strong",
+                    )}
+                  >
+                    <input
+                      type="radio"
+                      name="property"
+                      checked={propertyId === p.id}
+                      onChange={() => setPropertyId(p.id)}
+                      className="accent-aqua-600"
+                    />
+                    <img src={p.coverImage} alt="" className="size-10 rounded-lg object-cover" />
+                    <div className="min-w-0">
+                      <p className="truncate font-semibold text-ink">{p.name}</p>
+                      <p className="truncate text-xs text-muted">
+                        {p.neighborhood}, {p.area}
+                      </p>
+                    </div>
+                  </label>
+                ))}
+
+                <label
+                  className={cn(
+                    "flex cursor-pointer items-center gap-3 rounded-2xl p-3 ring-1 transition-colors",
+                    propertyId === "__new" ? "bg-aqua-50 ring-aqua-600" : "bg-ivory ring-hairline hover:ring-hairline-strong",
+                  )}
+                >
+                  <input
+                    type="radio"
+                    name="property"
+                    checked={propertyId === "__new"}
+                    onChange={() => setPropertyId("__new")}
+                    className="accent-aqua-600"
+                  />
+                  <span className="flex size-10 items-center justify-center rounded-lg bg-ivory-deep text-muted">
+                    <Plus size={17} aria-hidden />
+                  </span>
+                  <span className="font-semibold text-ink">A new property</span>
+                </label>
+              </div>
+
+              {propertyId === "__new" && (
+                <div className="mt-5 grid gap-4 sm:grid-cols-2">
+                  <Field label="Property name">
+                    <input
+                      value={newPropertyName}
+                      onChange={(e) => setNewPropertyName(e.target.value)}
+                      placeholder="e.g. Rahman Villa"
+                      className={inputClass}
+                    />
+                  </Field>
+                  <Field label={t("filter.area")}>
+                    <AreaPicker value={area} onChange={setArea} />
+                  </Field>
+                  <Field label={t("list.neighbourhood")}>
+                    <input
+                      value={neighborhood}
+                      onChange={(e) => setNeighborhood(e.target.value)}
+                      placeholder="e.g. Mirpur 10"
+                      className={inputClass}
+                    />
+                  </Field>
+                </div>
+              )}
+
+              {/* Only for a new property — an existing one already has a pin. */}
+              {propertyId === "new" && selectedArea && (
+                <div className="mt-7 border-t border-hairline pt-6">
+                  <h3 className="mb-1 font-display font-bold text-ink">{t("map.pinTitle")}</h3>
+                  <p className="mb-4 text-sm leading-relaxed text-muted">{t("map.pinBody")}</p>
+                  <PinPicker
+                    centre={[selectedArea.latitude, selectedArea.longitude]}
+                    value={pin}
+                    onChange={setPin}
+                  />
+                </div>
+              )}
+            </Step>
+          )}
+
+          {step === 2 && (
+            <Step title={`About this ${SPACE_TYPE_LABEL[spaceType].toLowerCase()}`}>
+              <Field label="Name it">
+                <input
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder={placeholderName(spaceType)}
+                  className={inputClass}
+                />
+              </Field>
+
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                {fieldsFor(category).map((f) => (
+                  <Field key={f.key} label={f.label}>
+                    {f.kind === "bool" ? (
+                      <label className="flex h-11 items-center gap-2.5 rounded-xl bg-ivory px-3 text-sm ring-1 ring-hairline-strong">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(attrs[f.key])}
+                          onChange={(e) => setAttr(f.key, e.target.checked as never)}
+                          className="size-4 accent-aqua-600"
+                        />
+                        Yes
+                      </label>
+                    ) : f.kind === "text" ? (
+                      <input
+                        value={(attrs[f.key] as string) ?? ""}
+                        onChange={(e) => setAttr(f.key, e.target.value as never)}
+                        placeholder={f.placeholder}
+                        className={inputClass}
+                      />
+                    ) : (
+                      <input
+                        type="number"
+                        inputMode="numeric"
+                        min={0}
+                        value={(attrs[f.key] as number) ?? ""}
+                        onChange={(e) => setAttr(f.key, (e.target.value === "" ? undefined : Number(e.target.value)) as never)}
+                        placeholder={f.placeholder}
+                        className={cn(inputClass, "tnum")}
+                      />
+                    )}
+                  </Field>
+                ))}
+              </div>
+            </Step>
+          )}
+
+          {step === 3 && (
+            <Step title={t("list.whatIncluded")}>
+              <ul className="flex flex-wrap gap-2">
+                {AMENITIES_BY_CATEGORY[category].map((key) => {
+                  const { label, icon: Icon } = AMENITIES[key];
+                  const on = amenities.includes(key);
+                  return (
+                    <li key={key}>
+                      <Chip
+                        active={on}
+                        onClick={() =>
+                          setAmenities(on ? amenities.filter((a) => a !== key) : [...amenities, key])
+                        }
+                      >
+                        <Icon size={14} aria-hidden />
+                        {label}
+                      </Chip>
+                    </li>
+                  );
+                })}
+              </ul>
+              <p className="mt-4 text-xs text-muted">
+                Only the options that make sense for a {SPACE_TYPE_LABEL[spaceType].toLowerCase()} are shown.
+              </p>
+
+              {category === "living" && (
+                <div className="mt-7 border-t border-hairline pt-6">
+                  <h3 className="mb-1 font-display font-bold text-ink">{t("rules.title")}</h3>
+                  <p className="mb-4 text-xs text-muted">
+                    This is the first thing most renters filter on, so it's worth getting right.
+                  </p>
+
+                  <ul className="flex flex-wrap gap-2">
+                    <li>
+                      <Chip
+                        active={rules.familyAllowed}
+                        onClick={() => setRules({ ...rules, familyAllowed: !rules.familyAllowed })}
+                      >
+                        {t("filter.familyAllowed")}
+                      </Chip>
+                    </li>
+                    <li>
+                      <Chip
+                        active={rules.bachelorAllowed}
+                        onClick={() => setRules({ ...rules, bachelorAllowed: !rules.bachelorAllowed })}
+                      >
+                        {t("filter.bachelorAllowed")}
+                      </Chip>
+                    </li>
+                    <li>
+                      <Chip
+                        active={rules.studentFriendly}
+                        onClick={() => setRules({ ...rules, studentFriendly: !rules.studentFriendly })}
+                      >
+                        {t("filter.studentFriendly")}
+                      </Chip>
+                    </li>
+                  </ul>
+
+                  <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                    <Field label="Gender preference">
+                      <select
+                        value={rules.genderPreference}
+                        onChange={(e) =>
+                          setRules({ ...rules, genderPreference: e.target.value as GenderPreference })
+                        }
+                        className={inputClass}
+                      >
+                        <option value="any">No preference</option>
+                        <option value="male">Men only</option>
+                        <option value="female">Women only</option>
+                      </select>
+                    </Field>
+                    <Field label="Maximum occupants">
+                      <input
+                        type="number"
+                        min={1}
+                        value={rules.maxOccupants ?? ""}
+                        placeholder="No limit"
+                        onChange={(e) =>
+                          setRules({
+                            ...rules,
+                            maxOccupants: e.target.value === "" ? null : Number(e.target.value),
+                          })
+                        }
+                        className={cn(inputClass, "tnum")}
+                      />
+                    </Field>
+                  </div>
+                </div>
+              )}
+            </Step>
+          )}
+
+          {step === 4 && (
+            <Step title={t("list.photos")}>
+              <p className="mb-5 text-sm text-muted">{t("list.photosLead")}</p>
+              <PhotoUploader
+                spaceId={draftId}
+                images={photos}
+                onChange={(next) => {
+                  setPhotosTouched(true);
+                  setPhotos(next);
+                }}
+              />
+            </Step>
+          )}
+
+          {step === 5 && (
+            <Step title={t("list.priceAvailability")}>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label={transaction === "rent" ? "Monthly rent" : "Asking price"}>
+                  <MoneyInput value={price} onChange={setPrice} />
+                </Field>
+                {transaction === "rent" && (
+                  <>
+                    <Field label="Service charge">
+                      <MoneyInput value={serviceCharge} onChange={setServiceCharge} allowEmpty />
+                    </Field>
+                    <Field label="Utilities">
+                      <MoneyInput value={utilities} onChange={setUtilities} allowEmpty />
+                    </Field>
+                  </>
+                )}
+                <Field label="Status">
+                  <select
+                    value={status}
+                    onChange={(e) => setStatus(e.target.value as AvailabilityStatus)}
+                    className={inputClass}
+                  >
+                    <option value="available">Available</option>
+                    <option value="partially-available">Partly available</option>
+                    <option value="available-soon">Available soon</option>
+                    <option value="occupied">Occupied</option>
+                    <option value="maintenance">Maintenance</option>
+                  </select>
+                </Field>
+                <Field label="Available from">
+                  <input
+                    type="date"
+                    value={availableFrom}
+                    onChange={(e) => setAvailableFrom(e.target.value)}
+                    className={inputClass}
+                  />
+                </Field>
+              </div>
+
+              {transaction === "rent" && (
+                <p className="mt-4 rounded-xl bg-aqua-50 p-3 text-xs leading-relaxed text-aqua-700">
+                  Listing every cost gets your space a total-cost figure on the card and lets it pass
+                  the "full cost disclosed" filter. Leaving them blank does the opposite.
+                </p>
+              )}
+            </Step>
+          )}
+
+          {step === 6 && (
+            <Step title={t("list.review")}>
+              {/* The fee, and what it buys. Shown before the summary so it is
+                  never a surprise at the moment of pressing publish. */}
+              {!editing && fee !== null && allowance !== null && (
+                <div className="mb-5 rounded-card bg-aqua-50 p-4 ring-1 ring-aqua-200">
+                  {allowance.used < 3 || allowance.hasPlan ? (
+                    <>
+                      <p className="font-display font-bold text-aqua-700">{t("fee.title")}</p>
+                      <p className="mt-1 text-sm leading-relaxed text-ink-soft">{t("fee.body")}</p>
+                      <div className="mt-3 flex flex-wrap items-baseline justify-between gap-2">
+                        <span className="text-sm text-muted">{t("fee.amount")}</span>
+                        <span className="font-display text-xl font-extrabold tnum text-ink">
+                          {money(fee)}
+                        </span>
+                      </div>
+                      {!allowance.hasPlan && (
+                        <p className="mt-1 text-xs text-muted">
+                          {t("fee.free", { used: allowance.used + 1 })}
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <p className="font-display font-bold text-warn-700">
+                        {t("fee.allowanceUsed")}
+                      </p>
+                      <p className="mt-1 text-sm leading-relaxed text-ink-soft">
+                        {t("fee.allowanceBody")}
+                      </p>
+                      <p className="mt-2 font-semibold tnum text-ink">{t("fee.planPrice")}</p>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        className="mt-3"
+                        disabled={paying}
+                        onClick={async () => {
+                          setPaying(true);
+                          try {
+                            await db.buyPropertyPlan(propertyId, 5000);
+                            setAllowance(await db.listingAllowance(propertyId));
+                            notify(t("fee.paid"));
+                          } finally {
+                            setPaying(false);
+                          }
+                        }}
+                      >
+                        {t("fee.buyPlan")}
+                      </Button>
+                    </>
+                  )}
+
+                  <p className="mt-3 text-xs leading-relaxed text-warn-700">{t("fee.sandbox")}</p>
+                </div>
+              )}
+
+              <dl className="divide-y divide-hairline rounded-2xl bg-ivory ring-1 ring-hairline">
+                <Review label="Space" value={`${name || SPACE_TYPE_LABEL[spaceType]} · ${SPACE_TYPE_LABEL[spaceType]}`} />
+                <Review
+                  label="Property"
+                  value={
+                    propertyId === "__new"
+                      ? `${newPropertyName || "New property"} (new) · ${area}`
+                      : properties.find((p) => p.id === propertyId)?.name ?? "—"
+                  }
+                />
+                <Review
+                  label={transaction === "rent" ? "Rent" : "Price"}
+                  value={
+                    money(price) +
+                    (transaction === "rent" && serviceCharge !== "" && utilities !== ""
+                      ? ` · about ${money(price + Number(serviceCharge) + Number(utilities))} all in`
+                      : "")
+                  }
+                />
+                <Review label="Availability" value={status.replace("-", " ")} />
+                <Review label="Included" value={amenities.length ? amenities.map((a) => t(`amenity.${a}` as never)).join(", ") : "Nothing listed"} />
+              </dl>
+
+              <p className="mt-4 text-xs leading-relaxed text-muted">
+                Placeholder images are attached automatically in this prototype. The space is saved
+                on this device and appears immediately in search and in your portfolio.
+              </p>
+            </Step>
+          )}
+
+          {/* Controls */}
+          <div className="mt-8 flex items-center gap-3 border-t border-hairline pt-5">
+            {step > 0 && (
+              <Button variant="secondary" onClick={() => setStep((s) => s - 1)}>
+                <ArrowLeft size={16} aria-hidden />
+                Back
+              </Button>
+            )}
+            <span className="ml-auto text-xs tnum text-muted">
+              Step {step + 1} of {STEPS.length}
+            </span>
+            {step < STEPS.length - 1 ? (
+              <Button disabled={!canAdvance()} onClick={() => setStep((s) => s + 1)}>
+                Continue
+                <ArrowRight size={16} aria-hidden />
+              </Button>
+            ) : (
+              <Button disabled={saving} onClick={() => void (editing ? saveEdit() : publish())}>
+                <Check size={16} aria-hidden />
+                {saving
+                  ? t("action.publishing")
+                  : editing
+                    ? t("action.saveChanges")
+                    : !editing && fee !== null && allowance !== null && allowance.used < 3
+                      ? t("fee.pay")
+                      : t("action.publish")}
+              </Button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <Modal
+        open={confirmDelete}
+        onClose={() => setConfirmDelete(false)}
+        title={t("edit.deleteTitle")}
+        footer={
+          <div className="flex gap-2">
+            <Button variant="secondary" fullWidth onClick={() => setConfirmDelete(false)}>
+              {t("action.cancel")}
+            </Button>
+            <Button variant="destructive" fullWidth disabled={working} onClick={() => void destroy()}>
+              {t("edit.delete")}
+            </Button>
+          </div>
+        }
+      >
+        <p className="text-sm leading-relaxed text-ink-soft">{t("edit.deleteBody")}</p>
+        <p className="mt-3 rounded-xl bg-warn-100 p-3 text-sm leading-relaxed text-warn-700">
+          {t("edit.deleteWarning")}
+        </p>
+      </Modal>
+    </>
+  );
+}
+
+/** The illustration used when a listing has no photographs of its own. */
+function placeholderImages(category: SpaceCategory, label: string): SpaceImage[] {
+  return [0, 1].map((i) => ({
+    url: `/photos/${category}-${(i % 2) + 1}.svg`,
+    label: i === 0 ? "Main" : "Second view",
+    alt: `Illustrative placeholder image for ${label}`,
+    demo: true as const,
+  }));
+}
+
+/* ── Adaptive field sets ──────────────────────────────────────────── */
+
+interface FieldSpec {
+  key: keyof SpaceAttributes;
+  label: string;
+  kind: "number" | "bool" | "text";
+  placeholder?: string;
+}
+
+function fieldsFor(category: SpaceCategory): FieldSpec[] {
+  switch (category) {
+    case "living":
+      return [
+        { key: "bedrooms", label: "Bedrooms", kind: "number", placeholder: "2" },
+        { key: "bathrooms", label: "Bathrooms", kind: "number", placeholder: "2" },
+        { key: "sizeSqft", label: "Size (sqft)", kind: "number", placeholder: "950" },
+        { key: "floor", label: "Floor", kind: "number", placeholder: "3" },
+        { key: "balcony", label: "Balcony", kind: "bool" },
+        { key: "kitchen", label: "Kitchen", kind: "bool" },
+      ];
+    case "business":
+      return [
+        { key: "sizeSqft", label: "Size (sqft)", kind: "number", placeholder: "400" },
+        { key: "floor", label: "Floor", kind: "number", placeholder: "0 for ground" },
+        { key: "frontageFt", label: "Frontage (ft)", kind: "number", placeholder: "14" },
+        { key: "workstations", label: "Workstations", kind: "number", placeholder: "12" },
+        { key: "meetingRoom", label: "Meeting room", kind: "bool" },
+        { key: "suitableFor", label: "Suits which business", kind: "text", placeholder: "Pharmacy" },
+      ];
+    case "storage":
+      return [
+        { key: "sizeSqft", label: "Storage area (sqft)", kind: "number", placeholder: "1200" },
+        { key: "ceilingHeightFt", label: "Ceiling height (ft)", kind: "number", placeholder: "14" },
+        { key: "loadingAccess", label: "Loading access", kind: "bool" },
+        { key: "vehicleAccess", label: "Truck access", kind: "bool" },
+        { key: "suitableFor", label: "Suitable goods", kind: "text", placeholder: "Dry goods" },
+      ];
+    case "parking":
+      return [
+        { key: "carSlots", label: "Car slots", kind: "number", placeholder: "2" },
+        { key: "motorcycleSlots", label: "Motorcycle slots", kind: "number", placeholder: "4" },
+        { key: "covered", label: "Covered", kind: "bool" },
+        { key: "accessHours", label: "Access hours", kind: "text", placeholder: "24 hours" },
+      ];
+    case "land":
+      return [
+        { key: "landAreaDecimal", label: "Land area (decimal)", kind: "number", placeholder: "35" },
+        { key: "landUse", label: "Land use", kind: "text", placeholder: "Paddy" },
+        { key: "roadAccess", label: "Road access", kind: "bool" },
+        { key: "waterSource", label: "Water source", kind: "bool" },
+        { key: "leaseYears", label: "Lease length (years)", kind: "number", placeholder: "3" },
+      ];
+  }
+}
+
+function placeholderName(type: SpaceType): string {
+  switch (type) {
+    case "apartment": return "Flat 3A";
+    case "shop": return "Shop 01";
+    case "godown": return "Godown 01";
+    case "garage": return "Garage";
+    case "office": return "Second floor office";
+    case "farmland": return "North plot";
+    default: return SPACE_TYPE_LABEL[type];
+  }
+}
+
+/* ── Small pieces ─────────────────────────────────────────────────── */
+
+const inputClass =
+  "h-11 w-full rounded-xl bg-ivory px-3 text-[0.9375rem] text-ink ring-1 ring-hairline-strong focus:outline-none focus:ring-2 focus:ring-aqua-600";
+
+function Step({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <h2 className="mb-5 font-display text-xl font-bold text-ink">{title}</h2>
+      {children}
+    </div>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="block">
+      <span className="mb-1.5 block text-sm font-medium text-ink-soft">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function Chip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-full px-3.5 py-2 text-sm font-semibold transition-colors",
+        active ? "bg-ink text-ivory" : "bg-ivory-deep text-ink-soft hover:bg-hairline",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function MoneyInput({
+  value,
+  onChange,
+  allowEmpty,
+}: {
+  value: number | "";
+  onChange: (v: never) => void;
+  allowEmpty?: boolean;
+}) {
+  return (
+    <div className="relative">
+      <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted">৳</span>
+      <input
+        type="number"
+        inputMode="numeric"
+        step={500}
+        min={0}
+        value={value}
+        placeholder={allowEmpty ? "Not listed" : undefined}
+        onChange={(e) => onChange((e.target.value === "" ? "" : Number(e.target.value)) as never)}
+        className={cn(inputClass, "pl-7 tnum")}
+      />
+    </div>
+  );
+}
+
+function Review({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-wrap items-baseline justify-between gap-2 px-4 py-3">
+      <dt className="text-sm text-muted">{label}</dt>
+      <dd className="text-sm font-semibold text-ink">{value}</dd>
+    </div>
+  );
+}
